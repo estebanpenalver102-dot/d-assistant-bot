@@ -391,7 +391,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # === MAIN ===
 
 async def post_init(application: Application):
-    """Set up bot commands menu and start background jobs."""
+    """Set up bot commands menu, init DB, and start background jobs."""
+    await init_db()
     await application.bot.set_my_commands([
         BotCommand("start", "Start the bot"),
         BotCommand("help", "Show all commands"),
