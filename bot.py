@@ -36,6 +36,12 @@ from database import (
     mark_reminder_sent, get_user_reminders,
 )
 from ai_engine import get_ai_response, process_tool_calls
+from calendar_integration import (
+    is_calendar_configured, is_user_connected,
+    get_auth_url, complete_auth, create_calendar_event,
+    list_upcoming_events,
+)
+from fallback_engine import get_fallback_status
 
 # === LOGGING ===
 logging.basicConfig(
@@ -185,7 +191,29 @@ async def cmd_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         rid = await add_reminder(update.effective_user.id, reminder_text, remind_at)
         dt_str = datetime.fromtimestamp(remind_at).strftime("%Y-%m-%d %H:%M")
-        await update.message.reply_text(f"⏰ Reminder set for **{dt_str}**:\n_{reminder_text}_", parse_mode=ParseMode.MARKDOWN)
+
+        # Also create Google Calendar event if connected
+        cal_msg = ""
+        if is_user_connected(update.effective_user.id):
+            try:
+                event_time = datetime.fromtimestamp(remind_at)
+                event = await create_calendar_event(
+                    update.effective_user.id,
+                    reminder_text,
+                    event_time,
+                    description=f"Reminder set via D Assistant on Telegram",
+                    reminder_minutes=10,
+                )
+                if event:
+                    cal_msg = "\n📅 Also added to your Google Calendar with notification!"
+            except Exception as e:
+                logger.warning(f"Calendar event creation failed: {e}")
+                cal_msg = "\n⚠️ Couldn't sync to calendar (will retry next time)"
+
+        await update.message.reply_text(
+            f"⏰ Reminder set for **{dt_str}**:\n_{reminder_text}_{cal_msg}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
     except Exception as e:
         logger.error(f"Error in /remind: {e}")
@@ -252,17 +280,125 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uptime = time.time() - context.bot_data.get("start_time", time.time())
         hours = int(uptime // 3600)
         minutes = int((uptime % 3600) // 60)
+        cal_status = "📅 Calendar: Connected ✅" if is_user_connected(update.effective_user.id) else "📅 Calendar: Not connected (use /connect_calendar)"
+        fb_status = get_fallback_status()
         await update.message.reply_text(
             f"✅ **D Assistant Status**\n\n"
             f"🟢 Online and healthy\n"
             f"⏱ Uptime: {hours}h {minutes}m\n"
-            f"🤖 AI: Claude (Anthropic)\n"
+            f"{fb_status}\n"
             f"🔍 Search: DuckDuckGo\n"
-            f"💾 Memory: SQLite (persistent)",
+            f"💾 Memory: SQLite (persistent)\n"
+            f"{cal_status}",
             parse_mode=ParseMode.MARKDOWN,
         )
     except Exception as e:
         logger.error(f"Error in /status: {e}")
+
+
+# === CALENDAR COMMANDS ===
+
+# Track users awaiting auth code
+_awaiting_auth = set()
+
+
+async def cmd_connect_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start Google Calendar OAuth flow."""
+    try:
+        user_id = update.effective_user.id
+
+        if not is_calendar_configured():
+            await update.message.reply_text(
+                "⚠️ Google Calendar isn't configured yet.\n"
+                "The bot owner needs to set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET."
+            )
+            return
+
+        if is_user_connected(user_id):
+            await update.message.reply_text("✅ Your Google Calendar is already connected! Reminders will sync automatically.")
+            return
+
+        auth_url = get_auth_url(user_id)
+        if not auth_url:
+            await update.message.reply_text("❌ Failed to generate authorization URL.")
+            return
+
+        _awaiting_auth.add(user_id)
+        await update.message.reply_text(
+            "📅 **Connect Google Calendar**\n\n"
+            "1️⃣ Click this link to authorize:\n"
+            f"{auth_url}\n\n"
+            "2️⃣ Sign in with your Google account\n"
+            "3️⃣ Copy the authorization code\n"
+            "4️⃣ Paste it back here\n\n"
+            "After this, all your /remind commands will also create Google Calendar events with notifications! 🔔",
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.error(f"Error in /connect_calendar: {e}")
+        await update.message.reply_text("❌ Something went wrong. Try again.")
+
+
+async def cmd_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show upcoming calendar events."""
+    try:
+        user_id = update.effective_user.id
+        if not is_user_connected(user_id):
+            await update.message.reply_text("📅 Calendar not connected. Use /connect\\_calendar first!")
+            return
+
+        events = await list_upcoming_events(user_id, max_results=10)
+        if not events:
+            await update.message.reply_text("📅 No upcoming events on your calendar.")
+            return
+
+        lines = []
+        for event in events:
+            start = event["start"].get("dateTime", event["start"].get("date", ""))
+            try:
+                dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                date_str = dt.strftime("%b %d, %I:%M %p")
+            except Exception:
+                date_str = start
+            lines.append(f"• **{date_str}** — {event.get('summary', 'No title')}")
+
+        await update.message.reply_text(
+            "📅 **Upcoming Events:**\n\n" + "\n".join(lines),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as e:
+        logger.error(f"Error in /calendar: {e}")
+        await update.message.reply_text("❌ Couldn't fetch calendar events.")
+
+
+async def handle_auth_code(user_id: int, text: str, update: Update) -> bool:
+    """Check if message is a calendar auth code. Returns True if handled."""
+    if user_id not in _awaiting_auth:
+        return False
+
+    # Auth codes look like 4/... or similar
+    code = text.strip()
+    if len(code) < 10:
+        return False
+
+    _awaiting_auth.discard(user_id)
+    success = complete_auth(user_id, code)
+    if success:
+        await update.message.reply_text(
+            "✅ **Google Calendar connected!**\n\n"
+            "From now on, every reminder you set with /remind will also create a "
+            "Google Calendar event with a popup notification. 🔔\n\n"
+            "Try: `/remind 30m | Test calendar sync`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        await update.message.reply_text(
+            "❌ Authorization failed. The code might have expired.\n"
+            "Try /connect\\_calendar again to get a fresh link.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    return True
 
 
 # === MAIN MESSAGE HANDLER (the heart of the bot) ===
@@ -279,6 +415,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     user_text = update.message.text
+
+    # Check if this is a calendar auth code
+    if await handle_auth_code(user_id, user_text, update):
+        return
 
     # Start typing immediately (this is what prevents "bot not responding" perception)
     stop_typing = asyncio.Event()
@@ -404,6 +544,8 @@ async def post_init(application: Application):
         BotCommand("remind", "Set a reminder"),
         BotCommand("reminders", "View pending reminders"),
         BotCommand("status", "Bot health check"),
+        BotCommand("connect_calendar", "Connect Google Calendar"),
+        BotCommand("calendar", "View upcoming events"),
     ])
     application.bot_data["start_time"] = time.time()
     logger.info("✅ D Assistant is online and ready!")
@@ -441,6 +583,8 @@ def main():
     app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(CommandHandler("news", cmd_news))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("connect_calendar", cmd_connect_calendar))
+    app.add_handler(CommandHandler("calendar", cmd_calendar))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Global error handler
