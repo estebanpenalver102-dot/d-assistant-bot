@@ -1,12 +1,10 @@
 """
 D Assistant Bot — Google Calendar Integration
-Web-based OAuth2 flow: user clicks link → signs into any Google account → 
-auto-redirected back → bot stores tokens → done.
+Desktop OAuth2 flow: user clicks sign-in link → authorizes → copies redirect URL → bot extracts code.
 
 Requires:
-  - GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, RAILWAY_PUBLIC_URL env vars
-  - Google Cloud project with Calendar API enabled
-  - OAuth redirect URI set to: https://<RAILWAY_PUBLIC_URL>/oauth/callback
+  - GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET env vars
+  - Google Cloud project with Calendar API enabled + Desktop-type OAuth client
 """
 import os
 import json
@@ -15,9 +13,8 @@ import asyncio
 import secrets
 from datetime import datetime, timedelta
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse, parse_qs
 
-from aiohttp import web
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from googleapiclient.discovery import build
@@ -28,21 +25,14 @@ SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 TOKEN_DIR = os.getenv("TOKEN_DIR", "/data/tokens")
 Path(TOKEN_DIR).mkdir(parents=True, exist_ok=True)
 
-# In-memory state map: state_token → telegram_user_id
-_pending_auth: dict[str, int] = {}
+# Localhost redirect for Desktop-type OAuth clients (auto-allowed by Google)
+REDIRECT_URI = "http://localhost:9876"
 
-# Reference to the Telegram bot app (set during init)
+# Track users awaiting URL paste
+_awaiting_url: dict[int, str] = {}  # user_id → state token
+
+# Reference to Telegram bot app
 _bot_app = None
-
-
-def _get_redirect_uri():
-    """Build the OAuth2 redirect URI from the Railway public URL."""
-    base = os.getenv("RAILWAY_PUBLIC_URL", "").rstrip("/")
-    if not base:
-        return None
-    if not base.startswith("http"):
-        base = f"https://{base}"
-    return f"{base}/oauth/callback"
 
 
 def _get_client_id():
@@ -92,7 +82,7 @@ def _load_credentials(user_id: int) -> Credentials | None:
 
 
 def is_calendar_configured() -> bool:
-    return bool(_get_client_id() and _get_client_secret() and _get_redirect_uri())
+    return bool(_get_client_id() and _get_client_secret())
 
 
 def is_user_connected(user_id: int) -> bool:
@@ -101,19 +91,17 @@ def is_user_connected(user_id: int) -> bool:
 
 
 def get_auth_url(user_id: int) -> str | None:
-    """Generate Google OAuth2 authorization URL with web redirect."""
+    """Generate Google OAuth2 authorization URL with localhost redirect."""
     client_id = _get_client_id()
-    redirect_uri = _get_redirect_uri()
-    if not client_id or not redirect_uri:
+    if not client_id:
         return None
 
-    # Generate a unique state token to map callback → user
     state = secrets.token_urlsafe(32)
-    _pending_auth[state] = user_id
+    _awaiting_url[user_id] = state
 
     params = {
         "client_id": client_id,
-        "redirect_uri": redirect_uri,
+        "redirect_uri": REDIRECT_URI,
         "response_type": "code",
         "scope": " ".join(SCOPES),
         "access_type": "offline",
@@ -123,19 +111,81 @@ def get_auth_url(user_id: int) -> str | None:
     return f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
 
 
+def is_awaiting_url(user_id: int) -> bool:
+    return user_id in _awaiting_url
+
+
+async def handle_pasted_url(user_id: int, text: str) -> tuple[bool, str]:
+    """
+    Process a pasted URL or code from the user.
+    Returns (success, message).
+    """
+    if user_id not in _awaiting_url:
+        return False, ""
+
+    text = text.strip()
+
+    # Try to extract the code from a pasted URL or raw code
+    code = None
+
+    # Check if it's a full URL (http://localhost:9876?code=...&...)
+    if text.startswith("http"):
+        try:
+            parsed = urlparse(text)
+            params = parse_qs(parsed.query)
+            if "code" in params:
+                code = params["code"][0]
+                # Verify state if present
+                if "state" in params:
+                    expected_state = _awaiting_url.get(user_id)
+                    if params["state"][0] != expected_state:
+                        _awaiting_url.pop(user_id, None)
+                        return True, "❌ State mismatch — security check failed. Try /connect_calendar again."
+        except Exception:
+            pass
+
+    # If not a URL, try as a raw auth code (starts with 4/ usually)
+    if not code and ("/" in text or len(text) > 20):
+        code = text
+
+    if not code:
+        return True, (
+            "🤔 I couldn't find the authorization code in that.\n\n"
+            "After signing in, copy the **entire URL** from your browser's address bar "
+            "(it starts with `http://localhost:9876...`) and paste it here."
+        )
+
+    # Exchange the code for tokens
+    _awaiting_url.pop(user_id, None)
+    creds = await _exchange_code(code)
+
+    if not creds or not creds.refresh_token:
+        return True, "❌ Authorization failed. The code might have expired.\nTry /connect_calendar again to get a fresh link."
+
+    _save_credentials(user_id, creds)
+    logger.info(f"Calendar connected for user {user_id}")
+
+    return True, (
+        "✅ *Google Calendar connected!*\n\n"
+        "From now on, every reminder you set with /remind will also create a "
+        "Google Calendar event with a popup notification. 🔔\n\n"
+        "Try: `/remind 30m | Test calendar sync`\n"
+        "See events: `/calendar`"
+    )
+
+
 async def _exchange_code(auth_code: str) -> Credentials | None:
     """Exchange authorization code for tokens."""
     import aiohttp
 
     client_id = _get_client_id()
     client_secret = _get_client_secret()
-    redirect_uri = _get_redirect_uri()
 
     data = {
         "code": auth_code,
         "client_id": client_id,
         "client_secret": client_secret,
-        "redirect_uri": redirect_uri,
+        "redirect_uri": REDIRECT_URI,
         "grant_type": "authorization_code",
     }
 
@@ -157,126 +207,12 @@ async def _exchange_code(auth_code: str) -> Credentials | None:
     )
 
 
-# ============ AIOHTTP WEB HANDLERS ============
-
-async def handle_oauth_callback(request: web.Request) -> web.Response:
-    """Handle Google OAuth2 callback redirect."""
-    code = request.query.get("code")
-    state = request.query.get("state")
-    error = request.query.get("error")
-
-    if error:
-        logger.warning(f"OAuth error: {error}")
-        return web.Response(
-            text=_html_page("Authorization Cancelled",
-                           "You cancelled the sign-in. Go back to Telegram and try /connect_calendar again."),
-            content_type="text/html",
-        )
-
-    if not code or not state:
-        return web.Response(
-            text=_html_page("Invalid Request", "Missing authorization code or state."),
-            content_type="text/html",
-            status=400,
-        )
-
-    user_id = _pending_auth.pop(state, None)
-    if user_id is None:
-        return web.Response(
-            text=_html_page("Link Expired",
-                           "This authorization link has expired. Go back to Telegram and use /connect_calendar to get a fresh link."),
-            content_type="text/html",
-            status=400,
-        )
-
-    # Exchange code for tokens
-    creds = await _exchange_code(code)
-    if not creds or not creds.refresh_token:
-        return web.Response(
-            text=_html_page("Authorization Failed",
-                           "Couldn't complete the sign-in. Please try /connect_calendar again in Telegram."),
-            content_type="text/html",
-            status=500,
-        )
-
-    # Save credentials
-    _save_credentials(user_id, creds)
-    logger.info(f"Calendar connected for user {user_id}")
-
-    # Send confirmation message to the user via Telegram
-    try:
-        if _bot_app and _bot_app.bot:
-            await _bot_app.bot.send_message(
-                chat_id=user_id,
-                text=(
-                    "✅ *Google Calendar connected!*\n\n"
-                    "From now on, every reminder you set with /remind will also create a "
-                    "Google Calendar event with a popup notification. 🔔\n\n"
-                    "Try: `/remind 30m | Test calendar sync`\n"
-                    "See events: `/calendar`"
-                ),
-                parse_mode="Markdown",
-            )
-    except Exception as e:
-        logger.warning(f"Failed to send Telegram confirmation: {e}")
-
-    return web.Response(
-        text=_html_page("Connected! ✅",
-                       "Google Calendar is now linked to D Assistant.<br><br>"
-                       "You can close this tab and go back to Telegram. 🤖📅"),
-        content_type="text/html",
-    )
-
-
-async def handle_health(request: web.Request) -> web.Response:
-    return web.Response(text="OK")
-
-
-def _html_page(title: str, message: str) -> str:
-    return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{title} — D Assistant</title>
-<style>
-body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-       display: flex; align-items: center; justify-content: center; min-height: 100vh;
-       margin: 0; background: #0f0f0f; color: #fff; }}
-.card {{ background: #1a1a2e; border-radius: 16px; padding: 40px; max-width: 420px;
-         text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.3); }}
-h1 {{ margin: 0 0 16px; font-size: 24px; }}
-p {{ color: #aaa; line-height: 1.6; }}
-</style></head>
-<body><div class="card"><h1>{title}</h1><p>{message}</p></div></body></html>"""
-
-
-# ============ WEB SERVER LIFECYCLE ============
-
-_web_runner = None
-
-async def start_web_server(bot_app=None, port: int = None):
-    """Start the aiohttp web server for OAuth callbacks."""
-    global _bot_app, _web_runner
-    _bot_app = bot_app
-
-    if port is None:
-        port = int(os.getenv("PORT", "8080"))
-
-    app = web.Application()
-    app.router.add_get("/oauth/callback", handle_oauth_callback)
-    app.router.add_get("/health", handle_health)
-    app.router.add_get("/", handle_health)
-
-    _web_runner = web.AppRunner(app)
-    await _web_runner.setup()
-    site = web.TCPSite(_web_runner, "0.0.0.0", port)
-    await site.start()
-    logger.info(f"🌐 Web server started on port {port}")
-
-
-async def stop_web_server():
-    global _web_runner
-    if _web_runner:
-        await _web_runner.cleanup()
-        _web_runner = None
+def get_fallback_status() -> str:
+    """Return AI fallback status for /status command."""
+    from ai_engine import _using_fallback
+    if _using_fallback:
+        return "🧠 AI: Fallback mode (web search)"
+    return "🧠 AI: Gemini (active)"
 
 
 # ============ CALENDAR API OPERATIONS ============

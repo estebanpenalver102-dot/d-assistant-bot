@@ -39,7 +39,8 @@ from ai_engine import get_ai_response, process_tool_calls
 from calendar_integration import (
     is_calendar_configured, is_user_connected,
     get_auth_url, create_calendar_event,
-    list_upcoming_events, start_web_server,
+    list_upcoming_events, is_awaiting_url,
+    handle_pasted_url,
 )
 from fallback_engine import get_fallback_status
 
@@ -300,14 +301,14 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_connect_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start Google Calendar OAuth flow via web redirect."""
+    """Start Google Calendar OAuth flow with localhost redirect."""
     try:
         user_id = update.effective_user.id
 
         if not is_calendar_configured():
             await update.message.reply_text(
                 "⚠️ Google Calendar isn't configured yet.\n"
-                "The bot owner needs to set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and RAILWAY_PUBLIC_URL."
+                "The bot owner needs to set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET."
             )
             return
 
@@ -322,10 +323,13 @@ async def cmd_connect_calendar(update: Update, context: ContextTypes.DEFAULT_TYP
 
         await update.message.reply_text(
             "📅 **Connect Google Calendar**\n\n"
-            "Click below to sign in with any Google account:\n\n"
+            "**Step 1:** Click below to sign in:\n"
             f"👉 [Sign in with Google]({auth_url})\n\n"
-            "After you sign in, you'll be redirected back automatically. "
-            "I'll send you a confirmation right here when it's done! 🔔",
+            "**Step 2:** Sign in with any Google account.\n"
+            "_(If you see 'Google hasn't verified this app', click **Advanced** → **Go to D Assistant**)_\n\n"
+            "**Step 3:** After approving, your browser will show a page that can't load — that's normal!\n"
+            "Copy the **entire URL** from your browser's address bar and paste it here.\n\n"
+            "The URL starts with: `http://localhost:9876...`",
             parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=True,
         )
@@ -380,6 +384,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     user_text = update.message.text
+
+    # Check if user is pasting a calendar OAuth URL
+    if is_awaiting_url(user_id):
+        handled, message = await handle_pasted_url(user_id, user_text)
+        if handled:
+            await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
+            return
 
     # Start typing immediately (this is what prevents "bot not responding" perception)
     stop_typing = asyncio.Event()
@@ -509,13 +520,6 @@ async def post_init(application: Application):
         BotCommand("calendar", "View upcoming events"),
     ])
     application.bot_data["start_time"] = time.time()
-
-    # Start web server for OAuth callbacks
-    try:
-        await start_web_server(bot_app=application)
-    except Exception as e:
-        logger.warning(f"Web server failed to start (calendar OAuth won't work): {e}")
-
     logger.info("✅ D Assistant is online and ready!")
 
 
