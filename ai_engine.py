@@ -10,6 +10,10 @@ import google.generativeai as genai
 from config import GOOGLE_AI_API_KEY, GEMINI_MODELS, MAX_AI_TIMEOUT
 from database import get_memories, get_conversation_history, save_memory
 from web_search import search_web, search_news
+from fallback_engine import (
+    is_fallback_active, activate_fallback, deactivate_fallback,
+    should_try_recovery, get_fallback_response, get_fallback_status,
+)
 
 logger = logging.getLogger("DAssistant.AI")
 
@@ -83,10 +87,29 @@ async def _try_generate(model_name: str, history: list, message: str, timeout: i
 
 async def get_ai_response(user_id: int, user_message: str) -> str:
     """
-    Get Gemini response with full context + model fallback chain.
-    Tries each model in GEMINI_MODELS until one works.
+    Get AI response with smart fallback chain:
+    1. If Gemini is available → use it (try all models in chain)
+    2. If all models rate-limited → activate fallback mode (web search + templates)
+    3. Periodically retry Gemini during fallback → auto-recover when quota resets
     NEVER times out — always returns something useful.
     """
+    # === FALLBACK MODE: use web search + templates ===
+    if is_fallback_active():
+        # Periodically try Gemini recovery (every 5 min)
+        if should_try_recovery():
+            logger.info("🔄 Attempting Gemini recovery...")
+            result = await _try_generate(GEMINI_MODELS[0], [], user_message, 15)
+            if result:
+                deactivate_fallback()
+                logger.info("✅ Gemini recovered! Back to full AI mode.")
+                # Fall through to normal flow below
+            else:
+                logger.info("⏳ Gemini still rate-limited, staying in fallback")
+                return await get_fallback_response(user_message)
+        else:
+            return await get_fallback_response(user_message)
+
+    # === NORMAL MODE: Gemini with model fallback chain ===
     try:
         # Gather context in parallel
         memories, history = await asyncio.gather(
@@ -104,12 +127,21 @@ async def get_ai_response(user_id: int, user_message: str) -> str:
 
         # Try each model in the fallback chain
         per_model_timeout = MAX_AI_TIMEOUT // max(len(GEMINI_MODELS), 1)
+        all_rate_limited = True
         for model_name in GEMINI_MODELS:
             result = await _try_generate(model_name, history, full_message, per_model_timeout)
             if result:
+                # If we were recovering, confirm recovery
+                all_rate_limited = False
                 return result
 
-        return "⏱ All AI models are busy right now. Give me a moment and try again — I'll be back!"
+        # All models failed → activate fallback mode
+        if all_rate_limited:
+            activate_fallback()
+            logger.warning("🔄 All Gemini models exhausted — switching to fallback mode")
+            return await get_fallback_response(user_message)
+
+        return "⏱ AI is busy. Try again in a moment!"
 
     except Exception as e:
         logger.error(f"AI engine error: {e}", exc_info=True)
