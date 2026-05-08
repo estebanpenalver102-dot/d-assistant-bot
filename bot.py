@@ -38,9 +38,9 @@ from database import (
 from ai_engine import get_ai_response, process_tool_calls
 from calendar_integration import (
     is_calendar_configured, is_user_connected,
-    get_auth_url, create_calendar_event,
-    list_upcoming_events, is_awaiting_url,
-    handle_pasted_url,
+    create_calendar_event, list_upcoming_events,
+    get_setup_instructions, connect_user,
+    get_calendar_link,
 )
 from fallback_engine import get_fallback_status
 
@@ -195,9 +195,9 @@ async def cmd_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Also create Google Calendar event if connected
         cal_msg = ""
+        event_time = datetime.fromtimestamp(remind_at)
         if is_user_connected(update.effective_user.id):
             try:
-                event_time = datetime.fromtimestamp(remind_at)
                 event = await create_calendar_event(
                     update.effective_user.id,
                     reminder_text,
@@ -207,9 +207,15 @@ async def cmd_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 if event:
                     cal_msg = "\n📅 Also added to your Google Calendar with notification!"
+                else:
+                    cal_msg = "\n⚠️ Couldn't sync to calendar this time"
             except Exception as e:
                 logger.warning(f"Calendar event creation failed: {e}")
-                cal_msg = "\n⚠️ Couldn't sync to calendar (will retry next time)"
+                cal_msg = "\n⚠️ Couldn't sync to calendar this time"
+        else:
+            # Provide one-click Google Calendar link as fallback
+            cal_link = get_calendar_link(reminder_text, event_time)
+            cal_msg = f"\n\n📅 [Add to Google Calendar]({cal_link})"
 
         await update.message.reply_text(
             f"⏰ Reminder set for **{dt_str}**:\n_{reminder_text}_{cal_msg}",
@@ -301,35 +307,23 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_connect_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start Google Calendar OAuth flow with localhost redirect."""
+    """Connect Google Calendar via Apps Script bridge."""
     try:
         user_id = update.effective_user.id
 
-        if not is_calendar_configured():
-            await update.message.reply_text(
-                "⚠️ Google Calendar isn't configured yet.\n"
-                "The bot owner needs to set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET."
-            )
+        # Check if user passed a URL: /connect_calendar https://...
+        text = update.message.text.replace("/connect_calendar", "").strip()
+        if text:
+            ok, msg = await connect_user(user_id, text)
+            await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
             return
 
         if is_user_connected(user_id):
             await update.message.reply_text("✅ Your Google Calendar is already connected! Reminders will sync automatically.")
             return
 
-        auth_url = get_auth_url(user_id)
-        if not auth_url:
-            await update.message.reply_text("❌ Failed to generate authorization URL.")
-            return
-
         await update.message.reply_text(
-            "📅 **Connect Google Calendar**\n\n"
-            "**Step 1:** Click below to sign in:\n"
-            f"👉 [Sign in with Google]({auth_url})\n\n"
-            "**Step 2:** Sign in with any Google account.\n"
-            "_(If you see 'Google hasn't verified this app', click **Advanced** → **Go to D Assistant**)_\n\n"
-            "**Step 3:** After approving, your browser will show a page that can't load — that's normal!\n"
-            "Copy the **entire URL** from your browser's address bar and paste it here.\n\n"
-            "The URL starts with: `http://localhost:9876...`",
+            get_setup_instructions(),
             parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=True,
         )
@@ -353,13 +347,13 @@ async def cmd_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         lines = []
         for event in events:
-            start = event["start"].get("dateTime", event["start"].get("date", ""))
+            start = event.get("start", "")
             try:
                 dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
                 date_str = dt.strftime("%b %d, %I:%M %p")
             except Exception:
                 date_str = start
-            lines.append(f"• **{date_str}** — {event.get('summary', 'No title')}")
+            lines.append(f"• **{date_str}** — {event.get('title', 'No title')}")
 
         await update.message.reply_text(
             "📅 **Upcoming Events:**\n\n" + "\n".join(lines),
@@ -384,13 +378,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     user_text = update.message.text
-
-    # Check if user is pasting a calendar OAuth URL
-    if is_awaiting_url(user_id):
-        handled, message = await handle_pasted_url(user_id, user_text)
-        if handled:
-            await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
-            return
 
     # Start typing immediately (this is what prevents "bot not responding" perception)
     stop_typing = asyncio.Event()
