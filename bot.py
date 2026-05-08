@@ -38,8 +38,8 @@ from database import (
 from ai_engine import get_ai_response, process_tool_calls
 from calendar_integration import (
     is_calendar_configured, is_user_connected,
-    get_auth_url, complete_auth, create_calendar_event,
-    list_upcoming_events,
+    get_auth_url, create_calendar_event,
+    list_upcoming_events, start_web_server,
 )
 from fallback_engine import get_fallback_status
 
@@ -298,19 +298,16 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === CALENDAR COMMANDS ===
 
-# Track users awaiting auth code
-_awaiting_auth = set()
-
 
 async def cmd_connect_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start Google Calendar OAuth flow."""
+    """Start Google Calendar OAuth flow via web redirect."""
     try:
         user_id = update.effective_user.id
 
         if not is_calendar_configured():
             await update.message.reply_text(
                 "⚠️ Google Calendar isn't configured yet.\n"
-                "The bot owner needs to set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET."
+                "The bot owner needs to set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and RAILWAY_PUBLIC_URL."
             )
             return
 
@@ -323,15 +320,12 @@ async def cmd_connect_calendar(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text("❌ Failed to generate authorization URL.")
             return
 
-        _awaiting_auth.add(user_id)
         await update.message.reply_text(
             "📅 **Connect Google Calendar**\n\n"
-            "1️⃣ Click this link to authorize:\n"
-            f"{auth_url}\n\n"
-            "2️⃣ Sign in with your Google account\n"
-            "3️⃣ Copy the authorization code\n"
-            "4️⃣ Paste it back here\n\n"
-            "After this, all your /remind commands will also create Google Calendar events with notifications! 🔔",
+            "Click below to sign in with any Google account:\n\n"
+            f"👉 [Sign in with Google]({auth_url})\n\n"
+            "After you sign in, you'll be redirected back automatically. "
+            "I'll send you a confirmation right here when it's done! 🔔",
             parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=True,
         )
@@ -372,35 +366,6 @@ async def cmd_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Couldn't fetch calendar events.")
 
 
-async def handle_auth_code(user_id: int, text: str, update: Update) -> bool:
-    """Check if message is a calendar auth code. Returns True if handled."""
-    if user_id not in _awaiting_auth:
-        return False
-
-    # Auth codes look like 4/... or similar
-    code = text.strip()
-    if len(code) < 10:
-        return False
-
-    _awaiting_auth.discard(user_id)
-    success = complete_auth(user_id, code)
-    if success:
-        await update.message.reply_text(
-            "✅ **Google Calendar connected!**\n\n"
-            "From now on, every reminder you set with /remind will also create a "
-            "Google Calendar event with a popup notification. 🔔\n\n"
-            "Try: `/remind 30m | Test calendar sync`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    else:
-        await update.message.reply_text(
-            "❌ Authorization failed. The code might have expired.\n"
-            "Try /connect\\_calendar again to get a fresh link.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    return True
-
-
 # === MAIN MESSAGE HANDLER (the heart of the bot) ===
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -415,10 +380,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     user_text = update.message.text
-
-    # Check if this is a calendar auth code
-    if await handle_auth_code(user_id, user_text, update):
-        return
 
     # Start typing immediately (this is what prevents "bot not responding" perception)
     stop_typing = asyncio.Event()
@@ -548,6 +509,13 @@ async def post_init(application: Application):
         BotCommand("calendar", "View upcoming events"),
     ])
     application.bot_data["start_time"] = time.time()
+
+    # Start web server for OAuth callbacks
+    try:
+        await start_web_server(bot_app=application)
+    except Exception as e:
+        logger.warning(f"Web server failed to start (calendar OAuth won't work): {e}")
+
     logger.info("✅ D Assistant is online and ready!")
 
 
